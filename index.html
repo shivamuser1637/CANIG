@@ -1,191 +1,443 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>CANIG — Screen Sound Recorder</title>
-  <link rel="stylesheet" href="index.css" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>CANIG — Record Screen + Mic</title>
+  <link rel="stylesheet" href="index.css">
 </head>
 <body>
   <div class="wrap">
-    <div class="card">
-      <div class="brand">
+    <div class="card" role="region" aria-label="CANIG combined audio recorder">
+      <header class="brand">
         <div class="logo">CANIG</div>
         <div>
           <h1>CANIG</h1>
-          <p class="tag">Capture & Save — Screen / System Audio Only</p>
+          <div class="tag">Record screen/system audio + microphone — mix &amp; save</div>
         </div>
-        <div class="brand-right">v1.0</div>
-      </div>
+        <div class="version">v1.1</div>
+      </header>
 
       <p class="lead">
-        CANIG lets you record the <strong>sound</strong> from your screen or tab.
-        Click <strong>Start Recording</strong>, then select a window or tab and enable
-        <strong>“Share audio”</strong> when prompted.
+        Click <strong>Start (Screen + Mic)</strong> to choose a screen/tab to share (enable "Share audio") — CANIG will record that system audio and your microphone together.
       </p>
 
       <div class="controls">
-        <button id="startBtn" class="primary">Start Recording</button>
+        <button id="startAll" class="primary">Start (Screen + Mic)</button>
+        <button id="startMicOnly">Start (Mic only)</button>
         <button id="stopBtn" disabled>Stop</button>
-        <button id="playBtn" disabled>Play</button>
-        <button id="downloadBtn" disabled>Download</button>
-        <button id="muteBtn" disabled>Mute Preview</button>
+        <button id="pauseBtn" disabled>Pause</button>
+        <button id="resumeBtn" disabled>Resume</button>
       </div>
 
       <div class="meta">
-        <div class="chip" id="statusChip">Idle</div>
-        <div class="chip">Format: <span id="formatText">webm/opus</span></div>
-        <div class="chip">Size: <span id="sizeText">0 KB</span></div>
+        <div class="chip" id="status">Idle</div>
+        <div class="chip">Format: <span id="format">audio/webm (opus)</span></div>
+        <div class="chip">Size: <span id="size">0 KB</span></div>
         <div class="chip">Duration: <span id="duration">00:00</span></div>
       </div>
 
-      <audio id="playback" controls></audio>
-
-      <p class="note">
-        Note: Your recording never leaves your device — everything is processed locally.
-        Use the latest Chrome or Edge browser for best results.
-      </p>
-
-      <div class="footer">
-        <div class="danger">Local only — no uploads</div>
-        <div class="timer" id="recTimer">00:00</div>
+      <div class="recorder">
+        <audio id="preview" controls></audio>
+        <div class="rec-actions">
+          <input id="recName" placeholder="Recording name (optional)" />
+          <button id="saveBtn" disabled>Save Recording</button>
+        </div>
       </div>
+
+      <h3>Saved Recordings</h3>
+      <div id="recordingsList" class="list">
+        <!-- saved items appear here -->
+      </div>
+
+      <p class="note">Notes: recordings are stored locally in your browser via IndexedDB. Download any file to keep it outside the browser.</p>
     </div>
   </div>
 
-  <script>
-    const startBtn = document.getElementById('startBtn');
-    const stopBtn = document.getElementById('stopBtn');
-    const playBtn = document.getElementById('playBtn');
-    const downloadBtn = document.getElementById('downloadBtn');
-    const muteBtn = document.getElementById('muteBtn');
-    const playback = document.getElementById('playback');
-    const statusChip = document.getElementById('statusChip');
-    const sizeText = document.getElementById('sizeText');
-    const durationText = document.getElementById('duration');
-    const recTimer = document.getElementById('recTimer');
-    const formatText = document.getElementById('formatText');
+<script>
+/*
+  CANIG Recorder v1.1
+  - Mixes screen (system) audio + microphone into a single stream using AudioContext.
+  - Records via MediaRecorder and stores blobs in IndexedDB for persistent storage.
+  - Provides playback, download, rename, delete.
+  - Works best in Chrome/Edge desktop (use "Share audio" in the screen selection dialog).
+*/
 
-    let mediaRecorder = null;
-    let recordedChunks = [];
-    let capturedStream = null;
-    let recordingStart = null;
-    let timerInterval = null;
-    let audioURL = null;
+(async function () {
+  // Elements
+  const startAll = document.getElementById('startAll');
+  const startMicOnly = document.getElementById('startMicOnly');
+  const stopBtn = document.getElementById('stopBtn');
+  const pauseBtn = document.getElementById('pauseBtn');
+  const resumeBtn = document.getElementById('resumeBtn');
+  const status = document.getElementById('status');
+  const sizeEl = document.getElementById('size');
+  const durationEl = document.getElementById('duration');
+  const formatEl = document.getElementById('format');
+  const preview = document.getElementById('preview');
+  const recName = document.getElementById('recName');
+  const saveBtn = document.getElementById('saveBtn');
+  const recordingsList = document.getElementById('recordingsList');
 
-    function setStatus(txt, color) {
-      statusChip.textContent = txt;
-      statusChip.style.color = color || '';
+  // Recording variables
+  let mediaRecorder = null;
+  let recordedChunks = [];
+  let mixingStream = null;       // final mixed stream from AudioContext
+  let captureStream = null;      // screen stream (may contain audio)
+  let micStream = null;          // microphone stream
+  let audioContext = null;
+  let dest = null;
+  let startTime = null;
+  let timerInt = null;
+
+  // IndexedDB Simple wrapper
+  const DB_NAME = 'canig-db';
+  const STORE = 'recordings';
+  function openDB() {
+    return new Promise((res, rej) => {
+      const req = indexedDB.open(DB_NAME, 1);
+      req.onupgradeneeded = () => {
+        req.result.createObjectStore(STORE, { keyPath: 'id', autoIncrement: true });
+      };
+      req.onerror = () => rej(req.error);
+      req.onsuccess = () => res(req.result);
+    });
+  }
+  async function saveRecordingToDB(blob, name, duration) {
+    const db = await openDB();
+    return new Promise((res, rej) => {
+      const tx = db.transaction(STORE, 'readwrite');
+      const store = tx.objectStore(STORE);
+      const item = { name: name || `CANIG-${new Date().toISOString()}`, blob, created: Date.now(), duration };
+      const r = store.add(item);
+      r.onsuccess = () => res(r.result);
+      r.onerror = () => rej(r.error);
+    });
+  }
+  async function getAllRecordings() {
+    const db = await openDB();
+    return new Promise((res, rej) => {
+      const tx = db.transaction(STORE, 'readonly');
+      const store = tx.objectStore(STORE);
+      const items = [];
+      const cur = store.openCursor();
+      cur.onsuccess = () => {
+        const c = cur.result;
+        if (!c) { res(items); return; }
+        items.push({ id: c.primaryKey, ...c.value });
+        c.continue();
+      };
+      cur.onerror = () => rej(cur.error);
+    });
+  }
+  async function deleteRecording(id) {
+    const db = await openDB();
+    return new Promise((res, rej) => {
+      const tx = db.transaction(STORE, 'readwrite');
+      tx.objectStore(STORE).delete(id).onsuccess = () => res();
+      tx.onerror = () => rej(tx.error);
+    });
+  }
+  async function updateRecordingName(id, newName) {
+    const db = await openDB();
+    return new Promise((res, rej) => {
+      const tx = db.transaction(STORE, 'readwrite');
+      const store = tx.objectStore(STORE);
+      const req = store.get(id);
+      req.onsuccess = () => {
+        const obj = req.result;
+        obj.name = newName;
+        store.put(obj).onsuccess = () => res();
+      };
+      req.onerror = () => rej(req.error);
+    });
+  }
+
+  // Utils
+  function setStatus(text, color) {
+    status.textContent = text;
+    status.style.color = color || '';
+  }
+  function formatTime(s) {
+    const mm = String(Math.floor(s/60)).padStart(2, '0');
+    const ss = String(Math.floor(s % 60)).padStart(2, '0');
+    return `${mm}:${ss}`;
+  }
+
+  // Timer
+  function startTimer() {
+    startTime = Date.now();
+    timerInt = setInterval(() => {
+      const elapsed = (Date.now() - startTime)/1000;
+      durationEl.textContent = formatTime(elapsed);
+    }, 500);
+  }
+  function stopTimer() {
+    clearInterval(timerInt);
+    timerInt = null;
+  }
+
+  // Build mixed audio stream from screen + mic
+  async function createMixedStream({withScreen=true, withMic=true}) {
+    // Stop previous
+    if(audioContext) {
+      audioContext.close().catch(()=>{});
+      audioContext = null;
     }
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    dest = audioContext.createMediaStreamDestination();
 
-    function formatTime(s) {
-      const mm = String(Math.floor(s / 60)).padStart(2, '0');
-      const ss = String(Math.floor(s % 60)).padStart(2, '0');
-      return `${mm}:${ss}`;
-    }
+    // collect promise list
+    const tracks = [];
 
-    function updateTimer() {
-      if (!recordingStart) return;
-      const elapsed = (Date.now() - recordingStart) / 1000;
-      recTimer.textContent = formatTime(elapsed);
-      durationText.textContent = formatTime(elapsed);
-    }
-
-    startBtn.addEventListener('click', async () => {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
-        alert('Your browser does not support screen capture. Use Chrome or Edge.');
-        return;
-      }
-
-      startBtn.disabled = true;
-      setStatus('Requesting screen share...', '#ffda79');
-
+    if(withScreen) {
       try {
-        const constraints = { video: true, audio: true };
-        capturedStream = await navigator.mediaDevices.getDisplayMedia(constraints);
-
-        const audioTracks = capturedStream.getAudioTracks();
-        if (!audioTracks.length) {
-          setStatus('No audio track found in chosen source.', '#ff7b7b');
-          startBtn.disabled = false;
-          capturedStream.getTracks().forEach(t => t.stop());
-          return;
-        }
-
-        const audioOnlyStream = new MediaStream(audioTracks);
-        const mime =
-          MediaRecorder.isTypeSupported('audio/webm;codecs=opus')
-            ? 'audio/webm;codecs=opus'
-            : 'audio/webm';
-
-        recordedChunks = [];
-        mediaRecorder = new MediaRecorder(audioOnlyStream, { mimeType: mime });
-        formatText.textContent = mime;
-
-        mediaRecorder.ondataavailable = e => {
-          if (e.data.size > 0) recordedChunks.push(e.data);
-          const total = recordedChunks.reduce((s, b) => s + b.size, 0) / 1024;
-          sizeText.textContent = `${total.toFixed(1)} KB`;
-        };
-
-        mediaRecorder.onstop = () => {
-          const blob = new Blob(recordedChunks, { type: mime });
-          if (audioURL) URL.revokeObjectURL(audioURL);
-          audioURL = URL.createObjectURL(blob);
-          playback.src = audioURL;
-
-          playBtn.disabled = false;
-          downloadBtn.disabled = false;
-          muteBtn.disabled = false;
-          setStatus('Recording stopped — ready to play/download', '#8ef0b1');
-
-          if (capturedStream) capturedStream.getTracks().forEach(t => t.stop());
-          clearInterval(timerInterval);
-        };
-
-        mediaRecorder.start(250);
-        setStatus('Recording...', '#8ef0b1');
-        stopBtn.disabled = false;
-        startBtn.disabled = true;
-        playBtn.disabled = true;
-        downloadBtn.disabled = true;
-        muteBtn.disabled = true;
-
-        recordingStart = Date.now();
-        recTimer.textContent = '00:00';
-        timerInterval = setInterval(updateTimer, 500);
-      } catch (err) {
-        console.error(err);
-        setStatus('Capture cancelled or failed.', '#ff9b9b');
-        startBtn.disabled = false;
-        if (capturedStream) capturedStream.getTracks().forEach(t => t.stop());
+        captureStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+      } catch (e) {
+        captureStream = null;
+        console.warn('Screen capture failed', e);
+        throw new Error('Screen capture failed or was denied.');
       }
-    });
+      // if captureStream has audio tracks, connect them
+      const screenAudioTracks = captureStream.getAudioTracks();
+      if(screenAudioTracks && screenAudioTracks.length) {
+        const screenSource = audioContext.createMediaStreamSource(new MediaStream(screenAudioTracks));
+        screenSource.connect(dest);
+      }
+      // keep video track so user can share; we won't record video, but we need to stop it later
+      // tracks.push(...captureStream.getVideoTracks()); // not recorded, but we manage stopping
+    }
 
-    stopBtn.addEventListener('click', () => {
-      if (!mediaRecorder) return;
-      setStatus('Stopping...', '#ffd36b');
-      stopBtn.disabled = true;
-      startBtn.disabled = false;
+    if(withMic) {
+      try {
+        micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      } catch (e) {
+        micStream = null;
+        console.warn('Microphone access failed', e);
+        throw new Error('Microphone access failed or was denied.');
+      }
+      const micSource = audioContext.createMediaStreamSource(micStream);
+      micSource.connect(dest);
+    }
+
+    // the mixed audio is in dest.stream
+    return dest.stream;
+  }
+
+  // Start recording (screen + mic or mic only)
+  async function startRecordingMode(mode) {
+    // mode: 'both' or 'mic'
+    setStatus('Requesting permissions...', '#ffd36b');
+
+    try {
+      const withScreen = (mode === 'both');
+      const withMic = true; // always enable mic for your request
+      mixingStream = await createMixedStream({ withScreen, withMic });
+
+      // Prepare MediaRecorder
+      const options = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? { mimeType: 'audio/webm;codecs=opus' } : { mimeType: 'audio/webm' };
+      formatEl.textContent = options.mimeType || 'default';
+      recordedChunks = [];
+
+      mediaRecorder = new MediaRecorder(mixingStream, options);
+
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) {
+          recordedChunks.push(e.data);
+          const totalKB = recordedChunks.reduce((s,b)=>s + b.size, 0) / 1024;
+          sizeEl.textContent = `${totalKB.toFixed(1)} KB`;
+        }
+      };
+
+      mediaRecorder.onstop = () => {
+        // create blob and preview
+        const blob = new Blob(recordedChunks, { type: recordedChunks[0]?.type || 'audio/webm' });
+        const url = URL.createObjectURL(blob);
+        preview.src = url;
+        preview.controls = true;
+        saveBtn.disabled = false;
+        setStatus('Recording stopped — preview ready', '#8ef0b1');
+
+        // Stop raw streams (screen and mic) to release devices
+        if (captureStream) {
+          captureStream.getTracks().forEach(t => t.stop());
+          captureStream = null;
+        }
+        if (micStream) {
+          micStream.getTracks().forEach(t => t.stop());
+          micStream = null;
+        }
+        if (audioContext) {
+          audioContext.close().catch(()=>{});
+          audioContext = null;
+        }
+        stopTimer();
+      };
+
+      mediaRecorder.start(250); // periodic chunks
+      setStatus('Recording...', '#8ef0b1');
+      stopBtn.disabled = false;
+      pauseBtn.disabled = false;
+      resumeBtn.disabled = true;
+      startAll.disabled = true;
+      startMicOnly.disabled = true;
+      saveBtn.disabled = true;
+      preview.src = '';
+      durationEl.textContent = '00:00';
+      sizeEl.textContent = '0 KB';
+      startTimer();
+    } catch (err) {
+      console.error(err);
+      setStatus(err.message || 'Recording failed', '#ff7b7b');
+      startAll.disabled = false;
+      startMicOnly.disabled = false;
+    }
+  }
+
+  // Event handlers
+  startAll.addEventListener('click', () => startRecordingMode('both'));
+  startMicOnly.addEventListener('click', () => startRecordingMode('mic'));
+  stopBtn.addEventListener('click', () => {
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') {
       mediaRecorder.stop();
-    });
+      stopBtn.disabled = true;
+      pauseBtn.disabled = true;
+      resumeBtn.disabled = true;
+      startAll.disabled = false;
+      startMicOnly.disabled = false;
+    }
+  });
+  pauseBtn.addEventListener('click', () => {
+    if (mediaRecorder && mediaRecorder.state === 'recording') {
+      mediaRecorder.pause();
+      pauseBtn.disabled = true;
+      resumeBtn.disabled = false;
+      setStatus('Paused', '#ffd36b');
+      stopTimer();
+    }
+  });
+  resumeBtn.addEventListener('click', () => {
+    if (mediaRecorder && mediaRecorder.state === 'paused') {
+      mediaRecorder.resume();
+      pauseBtn.disabled = false;
+      resumeBtn.disabled = true;
+      setStatus('Recording...', '#8ef0b1');
+      startTimer();
+    }
+  });
 
-    playBtn.addEventListener('click', () => {
-      if (playback.src) playback.play();
-    });
+  // Save recording to DB
+  saveBtn.addEventListener('click', async () => {
+    if (!recordedChunks || recordedChunks.length === 0) return;
+    const blob = new Blob(recordedChunks, { type: recordedChunks[0].type || 'audio/webm' });
+    // approximate duration from UI timer
+    const durText = durationEl.textContent || '00:00';
+    const parts = durText.split(':'); const durSec = (+parts[0])*60 + (+parts[1]);
+    saveBtn.disabled = true;
+    setStatus('Saving...', '#ffd36b');
+    try {
+      await saveRecordingToDB(blob, recName.value.trim(), durSec);
+      recName.value = '';
+      setStatus('Saved locally', '#8ef0b1');
+      loadRecordings();
+    } catch (e) {
+      console.error(e);
+      setStatus('Save failed', '#ff7b7b');
+    } finally {
+      saveBtn.disabled = false;
+    }
+  });
 
-    downloadBtn.addEventListener('click', () => {
-      const blob = new Blob(recordedChunks, { type: 'audio/webm' });
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = `CANIG-audio-${Date.now()}.webm`;
-      a.click();
-    });
+  // Load saved recordings and render
+  async function loadRecordings() {
+    recordingsList.innerHTML = '';
+    const items = await getAllRecordings();
+    if (!items.length) {
+      recordingsList.innerHTML = '<div class="empty">No saved recordings</div>';
+      return;
+    }
+    items.sort((a,b)=>b.created - a.created); // newest first
+    for (const it of items) {
+      const row = document.createElement('div');
+      row.className = 'record-row';
+      const nameInp = document.createElement('input');
+      nameInp.className = 'rname';
+      nameInp.value = it.name || `Recording ${it.id}`;
+      const playBtn = document.createElement('button');
+      playBtn.textContent = 'Play';
+      const downloadBtn = document.createElement('button');
+      downloadBtn.textContent = 'Download';
+      const delBtn = document.createElement('button');
+      delBtn.textContent = 'Delete';
+      const info = document.createElement('div');
+      info.className = 'info';
+      info.textContent = `Saved: ${new Date(it.created).toLocaleString()} • ${formatTime(it.duration||0)}`;
 
-    muteBtn.addEventListener('click', () => {
-      playback.muted = !playback.muted;
-      muteBtn.textContent = playback.muted ? 'Unmute Preview' : 'Mute Preview';
-    });
-  </script>
+      // audio playback element for this recording
+      const audioEl = document.createElement('audio');
+      audioEl.controls = true;
+      audioEl.style.display = 'none'; // hidden unless play clicked
+
+      // create blob URL on demand
+      const blob = it.blob;
+      let url = null;
+      playBtn.addEventListener('click', () => {
+        if (!url) url = URL.createObjectURL(blob);
+        audioEl.src = url;
+        audioEl.style.display = '';
+        audioEl.play();
+      });
+
+      downloadBtn.addEventListener('click', () => {
+        if (!url) url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        const safeName = (it.name || 'CANIG-recording').replace(/\s+/g,'_');
+        a.download = `${safeName}-${new Date(it.created).toISOString().replace(/[:.]/g,'-')}.webm`;
+        a.click();
+      });
+
+      delBtn.addEventListener('click', async () => {
+        if (!confirm('Delete this recording?')) return;
+        await deleteRecording(it.id);
+        loadRecordings();
+      });
+
+      // rename support
+      nameInp.addEventListener('blur', async () => {
+        const newName = nameInp.value.trim();
+        if (newName && newName !== it.name) {
+          await updateRecordingName(it.id, newName);
+          loadRecordings();
+        }
+      });
+
+      const controls = document.createElement('div');
+      controls.className = 'rcontrols';
+      controls.appendChild(playBtn);
+      controls.appendChild(downloadBtn);
+      controls.appendChild(delBtn);
+
+      row.appendChild(nameInp);
+      row.appendChild(info);
+      row.appendChild(controls);
+      row.appendChild(audioEl);
+
+      recordingsList.appendChild(row);
+    }
+  }
+
+  // Initial load
+  loadRecordings();
+
+  // Cleanup when leaving page
+  window.addEventListener('beforeunload', () => {
+    if (captureStream) captureStream.getTracks().forEach(t=>t.stop());
+    if (micStream) micStream.getTracks().forEach(t=>t.stop());
+    if (audioContext) audioContext.close().catch(()=>{});
+  });
+
+})();
+</script>
 </body>
 </html>
